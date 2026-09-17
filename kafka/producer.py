@@ -1,4 +1,5 @@
 import json
+import random
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,237 +9,645 @@ from kafka import KafkaProducer
 
 
 # ============================================================
-# Configuration
+# CONFIGURATION
 # ============================================================
 
-KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
-KAFKA_TOPIC = "transactions"
+KAFKA_SERVER = "localhost:9092"
+TOPIC = "transactions"
 
-# Number of transactions to send per second.
-# We can change this later for load/failure experiments.
-TRANSACTIONS_PER_SECOND = 20
+# Development test first.
+MAX_TRANSACTIONS = 1000
 
-# Set to None to stream the entire dataset.
-# For the first test, keep this small.
-MAX_TRANSACTIONS = 100
+# Target streaming rate.
+TARGET_TPS = 100
+
+# Fixed random seed makes the experiment reproducible.
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
 
 
 # ============================================================
-# Locate dataset
+# PATHS
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATASET_PATH = PROJECT_ROOT / "data" / "creditcard.csv"
+
+DATASET_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "creditcard.csv"
+)
+
+ML_DIR = PROJECT_ROOT / "ml"
+
+FAILURE_DATASET_PATH = (
+    ML_DIR
+    / "failure_simulation_dataset.csv"
+)
 
 
 # ============================================================
-# Create Kafka producer
+# SYSTEM METRIC SIMULATION
+# ============================================================
+
+def generate_system_metrics(amount, fraud):
+    """
+    Generate simulated system-level conditions.
+
+    The original credit-card dataset does not contain
+    processing time, Kafka lag, or TPS.
+
+    Therefore these values represent the controlled
+    experimental environment.
+    """
+
+    # --------------------------------------------------------
+    # PROCESSING TIME
+    # --------------------------------------------------------
+
+    # Normal processing time: 10-30 ms
+    processing_time = random.uniform(10, 30)
+
+    # Higher-value transactions require more processing.
+    if amount > 1000:
+        processing_time += random.uniform(10, 25)
+
+    if amount > 5000:
+        processing_time += random.uniform(15, 30)
+
+    # Fraudulent transactions receive additional processing.
+    if fraud == 1:
+        processing_time += random.uniform(15, 35)
+
+    # --------------------------------------------------------
+    # KAFKA CONSUMER LAG
+    # --------------------------------------------------------
+
+    # Normal Kafka lag.
+    kafka_lag = random.uniform(5, 80)
+
+    # Occasionally simulate congestion.
+    if random.random() < 0.10:
+        kafka_lag += random.uniform(80, 180)
+
+    # --------------------------------------------------------
+    # THROUGHPUT
+    # --------------------------------------------------------
+
+    # Simulated current system throughput.
+    tps = random.uniform(70, 120)
+
+    return processing_time, kafka_lag, tps
+
+
+# ============================================================
+# FAILURE SIMULATION
+# ============================================================
+
+def determine_failure(
+    transaction_id,
+    amount,
+    processing_time,
+    kafka_lag,
+    tps
+):
+    """
+    Controlled synthetic failure injection.
+
+    Returns:
+        failure:
+            0 = success
+            1 = failure
+
+        failure_type:
+            Type of simulated failure
+    """
+
+    # --------------------------------------------------------
+    # 1. DATA VALIDATION FAILURE
+    # --------------------------------------------------------
+
+    if (
+        transaction_id is None
+        or amount is None
+        or amount <= 0
+    ):
+        return 1, "DATA_VALIDATION"
+
+    # --------------------------------------------------------
+    # 2. TIMEOUT FAILURE
+    # --------------------------------------------------------
+
+    if processing_time > 45:
+        return 1, "TIMEOUT"
+
+    # --------------------------------------------------------
+    # 3. HIGH KAFKA LAG
+    # --------------------------------------------------------
+
+    if kafka_lag > 100:
+        return 1, "HIGH_KAFKA_LAG"
+
+    # --------------------------------------------------------
+    # 4. RESOURCE PRESSURE
+    # --------------------------------------------------------
+
+    if (
+        tps > 110
+        and random.random() < 0.35
+    ):
+        return 1, "RESOURCE_PRESSURE"
+
+    # --------------------------------------------------------
+    # 5. TRANSIENT FAILURE
+    # --------------------------------------------------------
+
+    if random.random() < 0.03:
+        return 1, "TRANSIENT_FAILURE"
+
+    return 0, "NONE"
+
+
+# ============================================================
+# KAFKA PRODUCER
 # ============================================================
 
 def create_producer():
-    print("Connecting to Kafka...")
+    """
+    Create Kafka producer.
+    """
 
-    producer = KafkaProducer(
-        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        value_serializer=lambda value: json.dumps(value).encode("utf-8"),
-        key_serializer=lambda key: str(key).encode("utf-8"),
+    return KafkaProducer(
+        bootstrap_servers=KAFKA_SERVER,
+
+        value_serializer=lambda value: (
+            json.dumps(value).encode("utf-8")
+        ),
+
+        key_serializer=lambda key: (
+            str(key).encode("utf-8")
+        ),
+
         acks="all",
         retries=5,
     )
 
-    print("Connected to Kafka successfully.")
-    return producer
-
 
 # ============================================================
-# Convert dataset row to transaction message
-# ============================================================
-
-def create_transaction(transaction_id, row):
-    transaction = {
-        "transaction_id": int(transaction_id),
-
-        # Original Time value from the Kaggle dataset
-        "original_time": float(row["Time"]),
-
-        # Timestamp generated when this transaction enters
-        # our simulated real-time pipeline
-        "event_time": datetime.now(timezone.utc).isoformat(),
-
-        "Amount": float(row["Amount"]),
-        "Class": int(row["Class"]),
-    }
-
-    # Add PCA features V1 - V28
-    for i in range(1, 29):
-        column = f"V{i}"
-        transaction[column] = float(row[column])
-
-    return transaction
-
-
-# ============================================================
-# Main streaming function
+# MAIN
 # ============================================================
 
 def main():
 
-    print("=" * 65)
-    print("REAL-TIME SELF-HEALING DATA PIPELINE")
-    print("Kafka Transaction Producer")
-    print("=" * 65)
+    print("=" * 70)
+    print("SELF-HEALING PIPELINE - TRANSACTION PRODUCER")
+    print("=" * 70)
 
     # --------------------------------------------------------
-    # Check dataset
+    # CHECK DATASET
     # --------------------------------------------------------
 
     if not DATASET_PATH.exists():
-        print(f"\nERROR: Dataset not found:")
-        print(DATASET_PATH)
-        return
+        raise FileNotFoundError(
+            f"Dataset not found: {DATASET_PATH}"
+        )
 
-    print(f"\nDataset: {DATASET_PATH}")
-
-    # --------------------------------------------------------
-    # Load dataset
-    # --------------------------------------------------------
-
-    print("Loading credit card transaction dataset...")
-
-    df = pd.read_csv(DATASET_PATH)
-
-    print(f"Dataset loaded successfully.")
-    print(f"Total transactions available: {len(df):,}")
-
-    required_columns = (
-        ["Time"]
-        + [f"V{i}" for i in range(1, 29)]
-        + ["Amount", "Class"]
+    # Make sure ML folder exists.
+    ML_DIR.mkdir(
+        parents=True,
+        exist_ok=True
     )
 
-    missing_columns = [
-        column
-        for column in required_columns
-        if column not in df.columns
-    ]
-
-    if missing_columns:
-        print("\nERROR: Required columns are missing:")
-        print(missing_columns)
-        return
-
     # --------------------------------------------------------
-    # Limit transactions during development/testing
+    # LOAD DATASET
     # --------------------------------------------------------
 
-    if MAX_TRANSACTIONS is not None:
-        df = df.head(MAX_TRANSACTIONS)
+    print(
+        f"\nLoading dataset: {DATASET_PATH}"
+    )
 
-    total_to_send = len(df)
+    df = pd.read_csv(
+        DATASET_PATH
+    )
 
-    print(f"Transactions for this run: {total_to_send:,}")
-    print(f"Target rate: {TRANSACTIONS_PER_SECOND} transactions/sec")
-    print(f"Kafka topic: {KAFKA_TOPIC}")
+    print(
+        f"Dataset rows available : {len(df):,}"
+    )
+
+    print(
+        f"Transactions this run  : {MAX_TRANSACTIONS:,}"
+    )
+
+    print(
+        f"Target TPS             : {TARGET_TPS}"
+    )
+
+    print(
+        f"Kafka topic            : {TOPIC}"
+    )
+
+    print(
+        f"Random seed            : {RANDOM_SEED}"
+    )
 
     # --------------------------------------------------------
-    # Connect to Kafka
+    # CREATE KAFKA PRODUCER
     # --------------------------------------------------------
 
-    try:
-        producer = create_producer()
+    producer = create_producer()
 
-    except Exception as error:
-        print("\nCould not connect to Kafka.")
-        print(error)
-        return
+    # --------------------------------------------------------
+    # COUNTERS
+    # --------------------------------------------------------
 
-    delay = 1 / TRANSACTIONS_PER_SECOND
+    successful_sends = 0
+    simulated_failures = 0
 
-    successful = 0
-    failed = 0
+    failure_counts = {}
+
+    # --------------------------------------------------------
+    # TRAINING DATA STORAGE
+    # --------------------------------------------------------
+
+    # Every transaction used in the simulation will also be
+    # saved here for later XGBoost training.
+    training_records = []
+
+    # --------------------------------------------------------
+    # TIMER
+    # --------------------------------------------------------
 
     start_time = time.perf_counter()
 
-    print("\nStarting transaction stream...")
-    print("Press Ctrl+C to stop.\n")
+    delay = 1.0 / TARGET_TPS
 
-    try:
+    # ========================================================
+    # STREAM TRANSACTIONS
+    # ========================================================
 
-        for index, row in df.iterrows():
+    for index, row in df.head(
+        MAX_TRANSACTIONS
+    ).iterrows():
 
-            transaction_id = index + 1
+        # ----------------------------------------------------
+        # TRANSACTION INFORMATION
+        # ----------------------------------------------------
 
-            transaction = create_transaction(
-                transaction_id,
-                row
+        transaction_id = int(
+            index + 1
+        )
+
+        amount = float(
+            row["Amount"]
+        )
+
+        fraud = int(
+            row["Class"]
+        )
+
+        # ----------------------------------------------------
+        # GENERATE SYSTEM CONDITIONS
+        # ----------------------------------------------------
+
+        (
+            processing_time,
+            kafka_lag,
+            tps
+        ) = generate_system_metrics(
+            amount,
+            fraud
+        )
+
+        # ----------------------------------------------------
+        # DETERMINE FAILURE
+        # ----------------------------------------------------
+
+        (
+            failure,
+            failure_type
+        ) = determine_failure(
+            transaction_id,
+            amount,
+            processing_time,
+            kafka_lag,
+            tps
+        )
+
+        # ----------------------------------------------------
+        # COUNT FAILURES
+        # ----------------------------------------------------
+
+        if failure:
+
+            simulated_failures += 1
+
+            failure_counts[
+                failure_type
+            ] = (
+                failure_counts.get(
+                    failure_type,
+                    0
+                )
+                + 1
             )
 
-            try:
+        # ----------------------------------------------------
+        # CREATE KAFKA MESSAGE
+        # ----------------------------------------------------
 
-                producer.send(
-                    KAFKA_TOPIC,
-                    key=transaction_id,
-                    value=transaction
-                )
+        transaction = {
 
-                successful += 1
+            "transaction_id":
+                transaction_id,
 
-                # Don't print every transaction during large runs.
-                # Print first five and then every 20th transaction.
-                if successful <= 5 or successful % 20 == 0:
+            "timestamp":
+                datetime.now(
+                    timezone.utc
+                ).isoformat(),
 
-                    print(
-                        f"Sent transaction {transaction_id} | "
-                        f"Amount=${transaction['Amount']:.2f} | "
-                        f"Class={transaction['Class']}"
-                    )
+            "amount":
+                amount,
 
-            except Exception as error:
+            "fraud":
+                fraud,
 
-                failed += 1
+            "processing_time":
+                round(
+                    processing_time,
+                    4
+                ),
 
-                print(
-                    f"Failed transaction {transaction_id}: {error}"
-                )
+            "kafka_lag":
+                round(
+                    kafka_lag,
+                    4
+                ),
 
-            time.sleep(delay)
+            "tps":
+                round(
+                    tps,
+                    4
+                ),
 
-    except KeyboardInterrupt:
+            "failure":
+                failure,
 
-        print("\nProducer stopped by user.")
+            "failure_type":
+                failure_type,
+        }
 
-    finally:
+        # ----------------------------------------------------
+        # PRESERVE PCA FEATURES V1-V28
+        # ----------------------------------------------------
 
-        # Ensure queued Kafka messages are actually delivered.
-        producer.flush()
-        producer.close()
+        for i in range(
+            1,
+            29
+        ):
 
-    # --------------------------------------------------------
-    # Producer statistics
-    # --------------------------------------------------------
+            transaction[
+                f"V{i}"
+            ] = float(
+                row[f"V{i}"]
+            )
 
-    elapsed_time = time.perf_counter() - start_time
+        # ----------------------------------------------------
+        # SAVE RECORD FOR XGBOOST DATASET
+        # ----------------------------------------------------
 
-    actual_rate = (
-        successful / elapsed_time
-        if elapsed_time > 0
+        training_records.append({
+
+            "transaction_id":
+                transaction_id,
+
+            "amount":
+                amount,
+
+            "fraud":
+                fraud,
+
+            "processing_time":
+                round(
+                    processing_time,
+                    4
+                ),
+
+            "kafka_lag":
+                round(
+                    kafka_lag,
+                    4
+                ),
+
+            "tps":
+                round(
+                    tps,
+                    4
+                ),
+
+            "failure":
+                failure,
+
+            "failure_type":
+                failure_type,
+        })
+
+        # ----------------------------------------------------
+        # SEND TO KAFKA
+        # ----------------------------------------------------
+
+        producer.send(
+            TOPIC,
+            key=transaction_id,
+            value=transaction
+        )
+
+        successful_sends += 1
+
+        # ----------------------------------------------------
+        # CONSOLE OUTPUT
+        # ----------------------------------------------------
+
+        if (
+            successful_sends <= 5
+            or
+            successful_sends % 100 == 0
+        ):
+
+            print(
+
+                f"Sent "
+                f"{transaction_id:5d} | "
+
+                f"Amount="
+                f"${amount:8.2f} | "
+
+                f"Fraud="
+                f"{fraud} | "
+
+                f"Time="
+                f"{processing_time:6.2f}ms | "
+
+                f"Lag="
+                f"{kafka_lag:6.2f}ms | "
+
+                f"TPS="
+                f"{tps:6.2f} | "
+
+                f"Failure="
+                f"{failure} | "
+
+                f"{failure_type}"
+            )
+
+        # ----------------------------------------------------
+        # CONTROL STREAMING RATE
+        # ----------------------------------------------------
+
+        time.sleep(
+            delay
+        )
+
+    # ========================================================
+    # FINISH KAFKA PRODUCER
+    # ========================================================
+
+    producer.flush()
+    producer.close()
+
+    # ========================================================
+    # SAVE FAILURE SIMULATION DATASET
+    # ========================================================
+
+    training_df = pd.DataFrame(
+        training_records
+    )
+
+    training_df.to_csv(
+        FAILURE_DATASET_PATH,
+        index=False
+    )
+
+    # ========================================================
+    # CALCULATE SUMMARY
+    # ========================================================
+
+    elapsed = (
+        time.perf_counter()
+        - start_time
+    )
+
+    actual_tps = (
+        successful_sends / elapsed
+        if elapsed > 0
         else 0
     )
 
-    print("\n" + "=" * 65)
-    print("PRODUCER SUMMARY")
-    print("=" * 65)
+    failure_rate = (
+        simulated_failures
+        / successful_sends
+        * 100
+        if successful_sends > 0
+        else 0
+    )
 
-    print(f"Successfully sent : {successful}")
-    print(f"Failed            : {failed}")
-    print(f"Elapsed time      : {elapsed_time:.2f} seconds")
-    print(f"Actual rate       : {actual_rate:.2f} transactions/sec")
+    # ========================================================
+    # DISPLAY SUMMARY
+    # ========================================================
 
-    print("=" * 65)
+    print(
+        "\n"
+        + "=" * 70
+    )
+
+    print(
+        "PRODUCER SUMMARY"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        f"Transactions sent  : "
+        f"{successful_sends:,}"
+    )
+
+    print(
+        f"Simulated failures : "
+        f"{simulated_failures:,}"
+    )
+
+    print(
+        f"Failure rate       : "
+        f"{failure_rate:.2f}%"
+    )
+
+    print(
+        f"Elapsed time       : "
+        f"{elapsed:.2f}s"
+    )
+
+    print(
+        f"Actual producer TPS: "
+        f"{actual_tps:.2f}"
+    )
+
+    print(
+        "\nFailure distribution:"
+    )
+
+    for (
+        failure_type,
+        count
+    ) in sorted(
+        failure_counts.items()
+    ):
+
+        print(
+            f"  "
+            f"{failure_type:<20} "
+            f"{count}"
+        )
+
+    # --------------------------------------------------------
+    # DATASET INFORMATION
+    # --------------------------------------------------------
+
+    print(
+        "\nML DATASET"
+    )
+
+    print(
+        "-" * 70
+    )
+
+    print(
+        f"Dataset path        : "
+        f"{FAILURE_DATASET_PATH}"
+    )
+
+    print(
+        f"Training records    : "
+        f"{len(training_df):,}"
+    )
+
+    print(
+        f"Failure records     : "
+        f"{int(training_df['failure'].sum()):,}"
+    )
+
+    print(
+        f"Normal records      : "
+        f"{int((training_df['failure'] == 0).sum()):,}"
+    )
+
+    print(
+        "=" * 70
+    )
 
 
 # ============================================================
-# Entry point
+# PROGRAM ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":

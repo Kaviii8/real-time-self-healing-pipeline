@@ -56,6 +56,10 @@ services:
       - "5050:80"
 
   spark-master:
+    build: 
+      context: "./"
+      dockerfile: spark/Dockerfile
+      
     image: apache/spark:3.4.1
     container_name: selfhealing-spark-master
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
@@ -68,6 +72,9 @@ services:
       - ./data:/opt/data
 
   spark-worker:
+    build:
+      context: "./"
+      dockerfile: spark/Dockerfile
     image: apache/spark:3.4.1
     container_name: selfhealing-spark-worker
     depends_on:

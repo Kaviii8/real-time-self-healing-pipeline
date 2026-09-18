@@ -60,53 +60,196 @@ print(
 
 
 # ============================================================
+# CHRONOLOGICAL 80/20 SPLIT
+# ============================================================
+
+# IMPORTANT:
+# Split the raw dataframe BEFORE calculating preprocessing
+# statistics. This prevents information from the test period
+# leaking into the training process.
+
+split_index = int(
+    len(df) * 0.80
+)
+
+train_df = df.iloc[
+    :split_index
+].copy()
+
+test_df = df.iloc[
+    split_index:
+].copy()
+
+
+print("\nDataset split:")
+
+print(
+    f"Training records : "
+    f"{len(train_df):,}"
+)
+
+print(
+    f"Testing records  : "
+    f"{len(test_df):,}"
+)
+
+print(
+    f"Training failures: "
+    f"{int(train_df['failure'].sum()):,}"
+)
+
+print(
+    f"Testing failures : "
+    f"{int(test_df['failure'].sum()):,}"
+)
+
+
+# ============================================================
+# PREPROCESSING STATISTICS
+# ============================================================
+
+# These values MUST come only from the training partition.
+
+processing_time_median = float(
+    train_df[
+        "processing_time"
+    ].median()
+)
+
+kafka_lag_median = float(
+    train_df[
+        "kafka_lag"
+    ].median()
+)
+
+
+print("\nTraining-only preprocessing statistics:")
+
+print(
+    f"Processing-time median : "
+    f"{processing_time_median:.4f}"
+)
+
+print(
+    f"Kafka-lag median       : "
+    f"{kafka_lag_median:.4f}"
+)
+
+
+# ============================================================
+# FEATURE ENGINEERING FUNCTION
+# ============================================================
+
+def create_features(
+    source_df,
+    processing_median,
+    lag_median
+):
+    """
+    Create model features.
+
+    The medians supplied to this function must be calculated
+    from the training partition only.
+    """
+
+    feature_df = source_df.copy()
+
+    # --------------------------------------------------------
+    # 1. LOG-TRANSFORMED AMOUNT
+    # --------------------------------------------------------
+
+    # Controlled validation failures can contain negative
+    # amounts because the producer injects sign corruption.
+    #
+    # log1p() cannot safely represent values <= -1.
+    # Therefore use transaction magnitude for this engineered
+    # feature while retaining the signed raw amount as a
+    # separate model feature.
+    feature_df[
+        "amount_log"
+    ] = np.log1p(
+        np.abs(
+            feature_df["amount"]
+        )
+    )
+
+    # --------------------------------------------------------
+    # 2. SQUARED PROCESSING TIME
+    # --------------------------------------------------------
+
+    feature_df[
+        "processing_time_squared"
+    ] = (
+        feature_df[
+            "processing_time"
+        ] ** 2
+    )
+
+    # --------------------------------------------------------
+    # 3. KAFKA LAG / TPS RATIO
+    # --------------------------------------------------------
+
+    feature_df[
+        "kafka_lag_ratio"
+    ] = (
+        feature_df[
+            "kafka_lag"
+        ]
+        /
+        (
+            feature_df[
+                "tps"
+            ]
+            + 1.0
+        )
+    )
+
+    # --------------------------------------------------------
+    # 4. HIGH PROCESSING INDICATOR
+    # --------------------------------------------------------
+
+    feature_df[
+        "high_processing"
+    ] = (
+        feature_df[
+            "processing_time"
+        ]
+        > processing_median
+    ).astype(int)
+
+    # --------------------------------------------------------
+    # 5. HIGH KAFKA LAG INDICATOR
+    # --------------------------------------------------------
+
+    feature_df[
+        "high_kafka_lag"
+    ] = (
+        feature_df[
+            "kafka_lag"
+        ]
+        > lag_median
+    ).astype(int)
+
+    return feature_df
+
+
+# ============================================================
 # FEATURE ENGINEERING
 # ============================================================
 
 print("\nCreating engineered features...")
 
-
-# 1. Log-transformed transaction amount
-df["amount_log"] = np.log1p(
-    df["amount"]
+train_features_df = create_features(
+    train_df,
+    processing_time_median,
+    kafka_lag_median
 )
 
-
-# 2. Squared processing time
-df["processing_time_squared"] = (
-    df["processing_time"] ** 2
+test_features_df = create_features(
+    test_df,
+    processing_time_median,
+    kafka_lag_median
 )
-
-
-# 3. Kafka lag relative to throughput
-df["kafka_lag_ratio"] = (
-    df["kafka_lag"]
-    / (df["tps"] + 1)
-)
-
-
-# Median values calculated from the available data.
-processing_median = (
-    df["processing_time"].median()
-)
-
-kafka_lag_median = (
-    df["kafka_lag"].median()
-)
-
-
-# 4. High-processing indicator
-df["high_processing"] = (
-    df["processing_time"]
-    > processing_median
-).astype(int)
-
-
-# 5. High Kafka-lag indicator
-df["high_kafka_lag"] = (
-    df["kafka_lag"]
-    > kafka_lag_median
-).astype(int)
 
 
 # ============================================================
@@ -133,58 +276,60 @@ feature_names = [
 target_name = "failure"
 
 
-X = df[feature_names]
+X_train = train_features_df[
+    feature_names
+].copy()
 
-y = df[target_name]
+X_test = test_features_df[
+    feature_names
+].copy()
+
+y_train = train_df[
+    target_name
+].copy()
+
+y_test = test_df[
+    target_name
+].copy()
 
 
 print("\nFeatures used:")
 
 for feature in feature_names:
-    print(f"  - {feature}")
+    print(
+        f"  - {feature}"
+    )
 
 
 # ============================================================
-# CHRONOLOGICAL 80/20 SPLIT
+# CHECK DATA
 # ============================================================
 
-split_index = int(
-    len(df) * 0.80
-)
+if X_train.isnull().any().any():
+    raise ValueError(
+        "NaN values found in training features."
+    )
 
-X_train = X.iloc[
-    :split_index
-].copy()
+if X_test.isnull().any().any():
+    raise ValueError(
+        "NaN values found in testing features."
+    )
 
-X_test = X.iloc[
-    split_index:
-].copy()
+if not np.isfinite(
+    X_train.to_numpy()
+).all():
 
-y_train = y.iloc[
-    :split_index
-].copy()
+    raise ValueError(
+        "Infinite values found in training features."
+    )
 
-y_test = y.iloc[
-    split_index:
-].copy()
+if not np.isfinite(
+    X_test.to_numpy()
+).all():
 
-
-print("\nDataset split:")
-print(
-    f"Training records : {len(X_train):,}"
-)
-
-print(
-    f"Testing records  : {len(X_test):,}"
-)
-
-print(
-    f"Training failures: {int(y_train.sum()):,}"
-)
-
-print(
-    f"Testing failures : {int(y_test.sum()):,}"
-)
+    raise ValueError(
+        "Infinite values found in testing features."
+    )
 
 
 # ============================================================
@@ -193,10 +338,12 @@ print(
 
 scaler = StandardScaler()
 
+# Fit ONLY using training data.
 X_train_scaled = scaler.fit_transform(
     X_train
 )
 
+# Apply the fitted scaler to testing data.
 X_test_scaled = scaler.transform(
     X_test
 )
@@ -307,35 +454,65 @@ f1 = f1_score(
     zero_division=0
 )
 
-roc_auc = roc_auc_score(
-    y_test,
-    y_probability
-)
 
+# ROC-AUC requires both classes in the test partition.
+if y_test.nunique() < 2:
+
+    roc_auc = None
+
+    print(
+        "\nROC-AUC cannot be calculated because "
+        "the test partition contains only one class."
+    )
+
+else:
+
+    roc_auc = roc_auc_score(
+        y_test,
+        y_probability
+    )
+
+
+# ============================================================
+# DISPLAY EVALUATION
+# ============================================================
 
 print("\n" + "=" * 70)
 print("MODEL EVALUATION")
 print("=" * 70)
 
 print(
-    f"Accuracy  : {accuracy * 100:.2f}%"
+    f"Accuracy  : "
+    f"{accuracy * 100:.2f}%"
 )
 
 print(
-    f"Precision : {precision * 100:.2f}%"
+    f"Precision : "
+    f"{precision * 100:.2f}%"
 )
 
 print(
-    f"Recall    : {recall * 100:.2f}%"
+    f"Recall    : "
+    f"{recall * 100:.2f}%"
 )
 
 print(
-    f"F1 Score  : {f1 * 100:.2f}%"
+    f"F1 Score  : "
+    f"{f1 * 100:.2f}%"
 )
 
-print(
-    f"ROC-AUC   : {roc_auc:.4f}"
-)
+if roc_auc is not None:
+
+    print(
+        f"ROC-AUC   : "
+        f"{roc_auc:.4f}"
+    )
+
+else:
+
+    print(
+        "ROC-AUC   : N/A"
+    )
 
 
 # ============================================================
@@ -344,7 +521,8 @@ print(
 
 cm = confusion_matrix(
     y_test,
-    y_pred
+    y_pred,
+    labels=[0, 1]
 )
 
 print("\nConfusion Matrix:")
@@ -380,48 +558,53 @@ plt.close()
 # ROC CURVE
 # ============================================================
 
-fpr, tpr, _ = roc_curve(
-    y_test,
-    y_probability
-)
+if roc_auc is not None:
 
-plt.figure()
+    fpr, tpr, _ = roc_curve(
+        y_test,
+        y_probability
+    )
 
-plt.plot(
-    fpr,
-    tpr,
-    label=f"XGBoost AUC = {roc_auc:.3f}"
-)
+    plt.figure()
 
-plt.plot(
-    [0, 1],
-    [0, 1],
-    linestyle="--",
-    label="Random classifier"
-)
+    plt.plot(
+        fpr,
+        tpr,
+        label=(
+            f"XGBoost AUC = "
+            f"{roc_auc:.3f}"
+        )
+    )
 
-plt.xlabel(
-    "False Positive Rate"
-)
+    plt.plot(
+        [0, 1],
+        [0, 1],
+        linestyle="--",
+        label="Random classifier"
+    )
 
-plt.ylabel(
-    "True Positive Rate"
-)
+    plt.xlabel(
+        "False Positive Rate"
+    )
 
-plt.title(
-    "Failure Prediction ROC Curve"
-)
+    plt.ylabel(
+        "True Positive Rate"
+    )
 
-plt.legend()
+    plt.title(
+        "Failure Prediction ROC Curve"
+    )
 
-plt.tight_layout()
+    plt.legend()
 
-plt.savefig(
-    OUTPUT_DIR / "roc_curve.png",
-    dpi=300
-)
+    plt.tight_layout()
 
-plt.close()
+    plt.savefig(
+        OUTPUT_DIR / "roc_curve.png",
+        dpi=300
+    )
+
+    plt.close()
 
 
 # ============================================================
@@ -449,8 +632,12 @@ plt.figure(
 )
 
 plt.barh(
-    importance_df["feature"],
-    importance_df["importance"]
+    importance_df[
+        "feature"
+    ],
+    importance_df[
+        "importance"
+    ]
 )
 
 plt.xlabel(
@@ -509,16 +696,24 @@ metrics = {
         float(f1),
 
     "roc_auc":
-        float(roc_auc),
+        (
+            float(roc_auc)
+            if roc_auc is not None
+            else None
+        ),
 
     "scale_pos_weight":
         float(scale_pos_weight),
 
     "processing_time_median":
-        float(processing_median),
+        float(
+            processing_time_median
+        ),
 
     "kafka_lag_median":
-        float(kafka_lag_median),
+        float(
+            kafka_lag_median
+        ),
 }
 
 
@@ -550,7 +745,7 @@ model_package = {
         feature_names,
 
     "processing_time_median":
-        processing_median,
+        processing_time_median,
 
     "kafka_lag_median":
         kafka_lag_median,
@@ -586,10 +781,12 @@ print(
     f"{OUTPUT_DIR / 'confusion_matrix.png'}"
 )
 
-print(
-    f"ROC Curve         : "
-    f"{OUTPUT_DIR / 'roc_curve.png'}"
-)
+if roc_auc is not None:
+
+    print(
+        f"ROC Curve         : "
+        f"{OUTPUT_DIR / 'roc_curve.png'}"
+    )
 
 print(
     f"Feature Importance: "

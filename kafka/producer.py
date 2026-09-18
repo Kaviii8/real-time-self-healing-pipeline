@@ -15,15 +15,40 @@ from kafka import KafkaProducer
 KAFKA_SERVER = "localhost:9092"
 TOPIC = "transactions"
 
-# Development test first.
+# Development experiment.
 MAX_TRANSACTIONS = 1000
 
-# Target streaming rate.
+# Target producer rate.
 TARGET_TPS = 100
 
-# Fixed random seed makes the experiment reproducible.
+# Fixed seed makes controlled failure injection reproducible.
 RANDOM_SEED = 42
 random.seed(RANDOM_SEED)
+
+
+# ============================================================
+# EXPERIMENTAL FAILURE PARAMETERS
+# ============================================================
+
+# Standard timeout before adaptive timeout healing is applied.
+BASE_TIMEOUT_MS = 30.0
+
+# Transactions above this lag are considered affected by
+# consumer congestion.
+KAFKA_LAG_THRESHOLD_MS = 100.0
+
+# High system throughput may create resource pressure.
+RESOURCE_TPS_THRESHOLD = 110.0
+
+# Controlled probability of a resource-pressure event when
+# throughput is above the threshold.
+RESOURCE_PRESSURE_RATE = 0.35
+
+# Controlled one-shot transient failure probability.
+TRANSIENT_FAILURE_RATE = 0.03
+
+# Controlled invalid-data injection rate.
+DATA_VALIDATION_RATE = 0.05
 
 
 # ============================================================
@@ -52,23 +77,25 @@ FAILURE_DATASET_PATH = (
 
 def generate_system_metrics(amount, fraud):
     """
-    Generate simulated system-level conditions.
+    Generate controlled system-level conditions.
 
-    The original credit-card dataset does not contain
-    processing time, Kafka lag, or TPS.
+    The ULB credit-card dataset contains transaction features,
+    Amount, Time, and Class, but does not contain processing
+    latency, Kafka lag, or system throughput.
 
-    Therefore these values represent the controlled
-    experimental environment.
+    These values therefore represent the controlled
+    experimental environment used by this project.
     """
 
     # --------------------------------------------------------
     # PROCESSING TIME
     # --------------------------------------------------------
 
-    # Normal processing time: 10-30 ms
+    # Standard processing time.
     processing_time = random.uniform(10, 30)
 
-    # Higher-value transactions require more processing.
+    # Higher-value transactions are assumed to require
+    # additional processing.
     if amount > 1000:
         processing_time += random.uniform(10, 25)
 
@@ -83,21 +110,23 @@ def generate_system_metrics(amount, fraud):
     # KAFKA CONSUMER LAG
     # --------------------------------------------------------
 
-    # Normal Kafka lag.
     kafka_lag = random.uniform(5, 80)
 
-    # Occasionally simulate congestion.
+    # Occasionally create a congestion event.
     if random.random() < 0.10:
         kafka_lag += random.uniform(80, 180)
 
     # --------------------------------------------------------
-    # THROUGHPUT
+    # SYSTEM THROUGHPUT
     # --------------------------------------------------------
 
-    # Simulated current system throughput.
     tps = random.uniform(70, 120)
 
-    return processing_time, kafka_lag, tps
+    return (
+        processing_time,
+        kafka_lag,
+        tps
+    )
 
 
 # ============================================================
@@ -112,15 +141,20 @@ def determine_failure(
     tps
 ):
     """
-    Controlled synthetic failure injection.
+    Determine whether the transaction experiences a controlled
+    failure.
 
-    Returns:
-        failure:
-            0 = success
-            1 = failure
+    Failure priority:
 
-        failure_type:
-            Type of simulated failure
+        1. DATA_VALIDATION
+        2. TIMEOUT
+        3. HIGH_KAFKA_LAG
+        4. RESOURCE_PRESSURE
+        5. TRANSIENT_FAILURE
+
+    Only one primary failure type is assigned to each
+    transaction. This makes evaluation easier and avoids
+    counting the same transaction multiple times.
     """
 
     # --------------------------------------------------------
@@ -138,14 +172,14 @@ def determine_failure(
     # 2. TIMEOUT FAILURE
     # --------------------------------------------------------
 
-    if processing_time > 45:
+    if processing_time > BASE_TIMEOUT_MS:
         return 1, "TIMEOUT"
 
     # --------------------------------------------------------
     # 3. HIGH KAFKA LAG
     # --------------------------------------------------------
 
-    if kafka_lag > 100:
+    if kafka_lag > KAFKA_LAG_THRESHOLD_MS:
         return 1, "HIGH_KAFKA_LAG"
 
     # --------------------------------------------------------
@@ -153,8 +187,8 @@ def determine_failure(
     # --------------------------------------------------------
 
     if (
-        tps > 110
-        and random.random() < 0.35
+        tps > RESOURCE_TPS_THRESHOLD
+        and random.random() < RESOURCE_PRESSURE_RATE
     ):
         return 1, "RESOURCE_PRESSURE"
 
@@ -162,7 +196,7 @@ def determine_failure(
     # 5. TRANSIENT FAILURE
     # --------------------------------------------------------
 
-    if random.random() < 0.03:
+    if random.random() < TRANSIENT_FAILURE_RATE:
         return 1, "TRANSIENT_FAILURE"
 
     return 0, "NONE"
@@ -174,7 +208,7 @@ def determine_failure(
 
 def create_producer():
     """
-    Create Kafka producer.
+    Create the Kafka producer.
     """
 
     return KafkaProducer(
@@ -212,7 +246,6 @@ def main():
             f"Dataset not found: {DATASET_PATH}"
         )
 
-    # Make sure ML folder exists.
     ML_DIR.mkdir(
         parents=True,
         exist_ok=True
@@ -230,12 +263,18 @@ def main():
         DATASET_PATH
     )
 
+    transactions_to_process = min(
+        MAX_TRANSACTIONS,
+        len(df)
+    )
+
     print(
         f"Dataset rows available : {len(df):,}"
     )
 
     print(
-        f"Transactions this run  : {MAX_TRANSACTIONS:,}"
+        f"Transactions this run  : "
+        f"{transactions_to_process:,}"
     )
 
     print(
@@ -250,6 +289,26 @@ def main():
         f"Random seed            : {RANDOM_SEED}"
     )
 
+    print(
+        f"Validation injection   : "
+        f"{DATA_VALIDATION_RATE * 100:.1f}%"
+    )
+
+    print(
+        f"Base timeout           : "
+        f"{BASE_TIMEOUT_MS:.1f} ms"
+    )
+
+    print(
+        f"Kafka lag threshold    : "
+        f"{KAFKA_LAG_THRESHOLD_MS:.1f} ms"
+    )
+
+    print(
+        f"Resource TPS threshold : "
+        f"{RESOURCE_TPS_THRESHOLD:.1f}"
+    )
+
     # --------------------------------------------------------
     # CREATE KAFKA PRODUCER
     # --------------------------------------------------------
@@ -262,15 +321,14 @@ def main():
 
     successful_sends = 0
     simulated_failures = 0
+    injected_validation_errors = 0
 
     failure_counts = {}
 
     # --------------------------------------------------------
-    # TRAINING DATA STORAGE
+    # ML TRAINING DATA STORAGE
     # --------------------------------------------------------
 
-    # Every transaction used in the simulation will also be
-    # saved here for later XGBoost training.
     training_records = []
 
     # --------------------------------------------------------
@@ -279,47 +337,82 @@ def main():
 
     start_time = time.perf_counter()
 
-    delay = 1.0 / TARGET_TPS
+    delay = (
+        1.0 / TARGET_TPS
+        if TARGET_TPS > 0
+        else 0
+    )
 
     # ========================================================
     # STREAM TRANSACTIONS
     # ========================================================
 
     for index, row in df.head(
-        MAX_TRANSACTIONS
+        transactions_to_process
     ).iterrows():
 
         # ----------------------------------------------------
-        # TRANSACTION INFORMATION
+        # ORIGINAL TRANSACTION INFORMATION
         # ----------------------------------------------------
 
         transaction_id = int(
             index + 1
         )
 
-        amount = float(
+        original_amount = float(
             row["Amount"]
         )
+
+        amount = original_amount
 
         fraud = int(
             row["Class"]
         )
 
         # ----------------------------------------------------
+        # CONTROLLED DATA CORRUPTION
+        # ----------------------------------------------------
+
+        data_corruption_type = "NONE"
+
+        if random.random() < DATA_VALIDATION_RATE:
+
+            # Controlled sign-inversion corruption.
+            #
+            # Example:
+            #     149.62 -> -149.62
+            #
+            # This allows the cleansing strategy to apply
+            # abs(amount) and then revalidate the record.
+            amount = -abs(
+                original_amount
+            )
+
+            data_corruption_type = (
+                "NEGATIVE_AMOUNT"
+            )
+
+            injected_validation_errors += 1
+
+        # ----------------------------------------------------
         # GENERATE SYSTEM CONDITIONS
         # ----------------------------------------------------
 
+        # Use the magnitude of the amount when generating
+        # system conditions. The negative sign represents
+        # data corruption and should not change simulated
+        # processing complexity.
         (
             processing_time,
             kafka_lag,
             tps
         ) = generate_system_metrics(
-            amount,
+            abs(amount),
             fraud
         )
 
         # ----------------------------------------------------
-        # DETERMINE FAILURE
+        # DETERMINE PRIMARY FAILURE
         # ----------------------------------------------------
 
         (
@@ -365,8 +458,24 @@ def main():
                     timezone.utc
                 ).isoformat(),
 
+            # Current value presented to the pipeline.
             "amount":
-                amount,
+                round(
+                    amount,
+                    4
+                ),
+
+            # Ground-truth value retained for experiment
+            # evaluation. Healing logic must NOT simply copy
+            # this value to repair a transaction.
+            "original_amount":
+                round(
+                    original_amount,
+                    4
+                ),
+
+            "data_corruption_type":
+                data_corruption_type,
 
             "fraud":
                 fraud,
@@ -412,7 +521,7 @@ def main():
             )
 
         # ----------------------------------------------------
-        # SAVE RECORD FOR XGBOOST DATASET
+        # SAVE RECORD FOR XGBOOST TRAINING
         # ----------------------------------------------------
 
         training_records.append({
@@ -420,8 +529,13 @@ def main():
             "transaction_id":
                 transaction_id,
 
+            # ML receives the transaction value visible to
+            # the processing pipeline.
             "amount":
-                amount,
+                round(
+                    amount,
+                    4
+                ),
 
             "fraud":
                 fraud,
@@ -449,6 +563,17 @@ def main():
 
             "failure_type":
                 failure_type,
+
+            # Experimental metadata. These fields are useful
+            # for evaluation but are NOT ML input features.
+            "original_amount":
+                round(
+                    original_amount,
+                    4
+                ),
+
+            "data_corruption_type":
+                data_corruption_type,
         })
 
         # ----------------------------------------------------
@@ -469,8 +594,7 @@ def main():
 
         if (
             successful_sends <= 5
-            or
-            successful_sends % 100 == 0
+            or successful_sends % 100 == 0
         ):
 
             print(
@@ -479,7 +603,7 @@ def main():
                 f"{transaction_id:5d} | "
 
                 f"Amount="
-                f"${amount:8.2f} | "
+                f"${amount:9.2f} | "
 
                 f"Fraud="
                 f"{fraud} | "
@@ -488,7 +612,7 @@ def main():
                 f"{processing_time:6.2f}ms | "
 
                 f"Lag="
-                f"{kafka_lag:6.2f}ms | "
+                f"{kafka_lag:7.2f}ms | "
 
                 f"TPS="
                 f"{tps:6.2f} | "
@@ -500,12 +624,13 @@ def main():
             )
 
         # ----------------------------------------------------
-        # CONTROL STREAMING RATE
+        # CONTROL PRODUCER RATE
         # ----------------------------------------------------
 
-        time.sleep(
-            delay
-        )
+        if delay > 0:
+            time.sleep(
+                delay
+            )
 
     # ========================================================
     # FINISH KAFKA PRODUCER
@@ -568,27 +693,32 @@ def main():
     )
 
     print(
-        f"Transactions sent  : "
+        f"Transactions sent          : "
         f"{successful_sends:,}"
     )
 
     print(
-        f"Simulated failures : "
+        f"Simulated failures         : "
         f"{simulated_failures:,}"
     )
 
     print(
-        f"Failure rate       : "
+        f"Failure rate               : "
         f"{failure_rate:.2f}%"
     )
 
     print(
-        f"Elapsed time       : "
+        f"Injected validation errors : "
+        f"{injected_validation_errors:,}"
+    )
+
+    print(
+        f"Elapsed time               : "
         f"{elapsed:.2f}s"
     )
 
     print(
-        f"Actual producer TPS: "
+        f"Actual producer TPS        : "
         f"{actual_tps:.2f}"
     )
 
@@ -610,7 +740,7 @@ def main():
         )
 
     # --------------------------------------------------------
-    # DATASET INFORMATION
+    # ML DATASET INFORMATION
     # --------------------------------------------------------
 
     print(

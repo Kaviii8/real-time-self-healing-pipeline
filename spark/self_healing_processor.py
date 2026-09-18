@@ -1791,7 +1791,12 @@ raw_stream = (
 
     .option(
         "startingOffsets",
-        "latest",
+        "earliest",
+    )
+
+    .option(
+        "maxOffsetsPerTrigger",
+        "1000",
     )
 
     .option(

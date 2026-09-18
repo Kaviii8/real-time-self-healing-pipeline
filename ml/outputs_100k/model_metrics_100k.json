@@ -1,0 +1,16 @@
+{
+    "total_records": 100000,
+    "training_records": 80000,
+    "testing_records": 20000,
+    "training_failures": 19283,
+    "testing_failures": 4840,
+    "accuracy": 0.8765,
+    "precision": 0.6821955719557196,
+    "recall": 0.9167355371900826,
+    "f1_score": 0.7822637517630466,
+    "roc_auc": 0.9345635807584117,
+    "true_negatives": 13093,
+    "false_positives": 2067,
+    "false_negatives": 403,
+    "true_positives": 4437
+}

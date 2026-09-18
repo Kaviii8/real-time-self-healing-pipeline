@@ -16,10 +16,10 @@ KAFKA_SERVER = "localhost:9092"
 TOPIC = "transactions"
 
 # Development experiment.
-MAX_TRANSACTIONS = 50
+MAX_TRANSACTIONS = 284807
 
 # Target producer rate.
-TARGET_TPS = 5
+TARGET_TPS = 100
 
 # Fixed seed makes controlled failure injection reproducible.
 RANDOM_SEED = 42

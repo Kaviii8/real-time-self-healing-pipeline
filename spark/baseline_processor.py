@@ -138,7 +138,7 @@ raw_stream = (
     )
     .option(
         "startingOffsets",
-        "latest"
+        "earliest"
     )
     .option(
         "failOnDataLoss",

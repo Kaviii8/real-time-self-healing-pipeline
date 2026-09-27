@@ -221,3 +221,6 @@ __marimo__/
 data/
 data/*.csv
 *.csv
+
+# External validation datasets
+data/paysim/

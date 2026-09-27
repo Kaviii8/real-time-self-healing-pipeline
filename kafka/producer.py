@@ -8,40 +8,34 @@ import pandas as pd
 from kafka import KafkaProducer
 
 
-# ============================================================
 # CONFIGURATION
-# ============================================================
 
 KAFKA_SERVER = "localhost:9092"
 TOPIC = "transactions"
 
-# Development experiment.
+# Development experiment
 MAX_TRANSACTIONS = 284807
 
-# Target producer rate.
+# Target producer rate
 TARGET_TPS = 100
 
-# Fixed seed makes controlled failure injection reproducible.
+# Fixed seed makes controlled failure injection reproducible
 RANDOM_SEED = 42
 random.seed(RANDOM_SEED)
 
 
-# ============================================================
 # EXPERIMENTAL FAILURE PARAMETERS
-# ============================================================
 
-# Standard timeout before adaptive timeout healing is applied.
+# Standard timeout before adaptive timeout healing is applied
 BASE_TIMEOUT_MS = 30.0
 
-# Transactions above this lag are considered affected by
-# consumer congestion.
+# Transactions above this lag are considered affected by consumer congestion
 KAFKA_LAG_THRESHOLD_MS = 100.0
 
 # High system throughput may create resource pressure.
 RESOURCE_TPS_THRESHOLD = 110.0
 
-# Controlled probability of a resource-pressure event when
-# throughput is above the threshold.
+# Controlled probability of a resource-pressure event when throughput is above the threshold.
 RESOURCE_PRESSURE_RATE = 0.35
 
 # Controlled one-shot transient failure probability.
@@ -51,9 +45,8 @@ TRANSIENT_FAILURE_RATE = 0.03
 DATA_VALIDATION_RATE = 0.05
 
 
-# ============================================================
 # PATHS
-# ============================================================
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -80,7 +73,7 @@ def generate_system_metrics(amount, fraud):
     Generate controlled system-level conditions.
 
     The ULB credit-card dataset contains transaction features,
-    Amount, Time, and Class, but does not contain processing
+    Amount, Time and Class, but does not contain processing
     latency, Kafka lag, or system throughput.
 
     These values therefore represent the controlled
@@ -94,8 +87,7 @@ def generate_system_metrics(amount, fraud):
     # Standard processing time.
     processing_time = random.uniform(10, 30)
 
-    # Higher-value transactions are assumed to require
-    # additional processing.
+    # Higher-value transactions are assumed to require additional processing.
     if amount > 1000:
         processing_time += random.uniform(10, 25)
 
@@ -157,9 +149,8 @@ def determine_failure(
     counting the same transaction multiple times.
     """
 
-    # --------------------------------------------------------
+    
     # 1. DATA VALIDATION FAILURE
-    # --------------------------------------------------------
 
     if (
         transaction_id is None
@@ -168,23 +159,17 @@ def determine_failure(
     ):
         return 1, "DATA_VALIDATION"
 
-    # --------------------------------------------------------
     # 2. TIMEOUT FAILURE
-    # --------------------------------------------------------
 
     if processing_time > BASE_TIMEOUT_MS:
         return 1, "TIMEOUT"
 
-    # --------------------------------------------------------
     # 3. HIGH KAFKA LAG
-    # --------------------------------------------------------
 
     if kafka_lag > KAFKA_LAG_THRESHOLD_MS:
         return 1, "HIGH_KAFKA_LAG"
 
-    # --------------------------------------------------------
     # 4. RESOURCE PRESSURE
-    # --------------------------------------------------------
 
     if (
         tps > RESOURCE_TPS_THRESHOLD
@@ -192,9 +177,8 @@ def determine_failure(
     ):
         return 1, "RESOURCE_PRESSURE"
 
-    # --------------------------------------------------------
     # 5. TRANSIENT FAILURE
-    # --------------------------------------------------------
+
 
     if random.random() < TRANSIENT_FAILURE_RATE:
         return 1, "TRANSIENT_FAILURE"
@@ -227,9 +211,8 @@ def create_producer():
     )
 
 
-# ============================================================
+
 # MAIN
-# ============================================================
 
 def main():
 
@@ -237,9 +220,7 @@ def main():
     print("SELF-HEALING PIPELINE - TRANSACTION PRODUCER")
     print("=" * 70)
 
-    # --------------------------------------------------------
     # CHECK DATASET
-    # --------------------------------------------------------
 
     if not DATASET_PATH.exists():
         raise FileNotFoundError(
@@ -251,9 +232,7 @@ def main():
         exist_ok=True
     )
 
-    # --------------------------------------------------------
     # LOAD DATASET
-    # --------------------------------------------------------
 
     print(
         f"\nLoading dataset: {DATASET_PATH}"
@@ -309,15 +288,12 @@ def main():
         f"{RESOURCE_TPS_THRESHOLD:.1f}"
     )
 
-    # --------------------------------------------------------
     # CREATE KAFKA PRODUCER
-    # --------------------------------------------------------
 
     producer = create_producer()
 
-    # --------------------------------------------------------
     # COUNTERS
-    # --------------------------------------------------------
+
 
     successful_sends = 0
     simulated_failures = 0
@@ -382,8 +358,7 @@ def main():
             # Example:
             #     149.62 -> -149.62
             #
-            # This allows the cleansing strategy to apply
-            # abs(amount) and then revalidate the record.
+            # This allows the cleansing strategy to apply abs(amount) and then revalidate the record.
             amount = -abs(
                 original_amount
             )
@@ -529,8 +504,7 @@ def main():
             "transaction_id":
                 transaction_id,
 
-            # ML receives the transaction value visible to
-            # the processing pipeline.
+            # ML receives the transaction value visible to the processing pipeline.
             "amount":
                 round(
                     amount,
